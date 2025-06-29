@@ -1,0 +1,102 @@
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
+
+// Use UART2 on ESP32
+HardwareSerial mySerial(2);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+uint8_t id = 1; // Slot number to save fingerprint (1-127)
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Initialize Serial2 (UART2) with correct pin mapping
+  mySerial.begin(57600, SERIAL_8N1, 27, 26);  // RX = 27, TX = 26
+  finger.begin(57600);
+
+  Serial.println("Connecting to fingerprint sensor...");
+  if (finger.verifyPassword()) {
+    Serial.println("✅ Sensor connected and verified.");
+  } else {
+    Serial.println("❌ Could not find fingerprint sensor or password incorrect.");
+    while (1) delay(1);
+  }
+
+  Serial.print("Sensor has "); Serial.print(finger.templateCount); Serial.println(" templates");
+  Serial.println("Ready to enroll a fingerprint.");
+  Serial.println("-----------------------------");
+}
+
+void loop() {
+  Serial.print("Start enrollment for ID "); Serial.println(id);
+  while (!getFingerprintEnroll());  // Try until enrolled
+  id++;  // Increment ID for next finger
+  delay(3000);  // Wait before next enroll
+}
+
+bool getFingerprintEnroll() {
+  int p = -1;
+  Serial.println("Place finger to enroll...");
+
+  // Wait for finger press
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) {
+      Serial.print(".");
+      delay(100);
+    } else if (p != FINGERPRINT_OK) {
+      Serial.println("❌ Error capturing image.");
+      return false;
+    }
+  }
+  Serial.println("\n✅ Image captured");
+
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) {
+    Serial.println("❌ Error converting image.");
+    return false;
+  }
+
+  Serial.println("Remove finger...");
+  delay(2000);
+  while (finger.getImage() != FINGERPRINT_NOFINGER);
+
+  Serial.println("Place same finger again...");
+  p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) {
+      Serial.print(".");
+      delay(100);
+    } else if (p != FINGERPRINT_OK) {
+      Serial.println("❌ Error capturing image.");
+      return false;
+    }
+  }
+
+  Serial.println("\n✅ Second image captured");
+
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) {
+    Serial.println("❌ Error converting second image.");
+    return false;
+  }
+
+  // Create model from both images
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK) {
+    Serial.println("❌ Error creating fingerprint model.");
+    return false;
+  }
+
+  // Save the model into sensor memory at position `id`
+  p = finger.storeModel(id);
+  if (p == FINGERPRINT_OK) {
+    Serial.println("✅ Fingerprint enrolled successfully!");
+    return true;
+  } else {
+    Serial.println("❌ Failed to store fingerprint.");
+    return false;
+  }
+}
