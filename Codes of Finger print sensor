@@ -12,7 +12,7 @@ void setup() {
   delay(1000);
 
   // Initialize Serial2 (UART2) with correct pin mapping
-  mySerial.begin(57600, SERIAL_8N1, 27, 26);  // RX = 27, TX = 26
+  mySerial.begin(57600, SERIAL_8N1, 16, 17);  // RX = 16, TX = 17
   finger.begin(57600);
 
   Serial.println("Connecting to fingerprint sensor...");
