@@ -1,0 +1,283 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+#define SS_PIN 5
+#define RST_PIN 22
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+const char* ssid = "Smart-Attendance";
+const char* password = "12345678";
+WebServer server(80);
+
+struct User {
+  String uid;
+  String name;
+  String age;
+  String residence;
+  unsigned long lastAttendance = 0;
+  int attendanceCount = 0;
+};
+
+#define MAX_USERS 50
+User users[MAX_USERS];
+int userCount = 0;
+
+String attendanceLog[50];
+int logIndex = 0;
+
+String tempUID = "";
+
+const char mainPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><title>Smart Attendance</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 30px auto; }
+  h1, h2 { text-align:center; }
+  .tabs { display:flex; justify-content:center; margin-bottom:20px; }
+  .tabs button { padding:10px 20px; margin: 0 5px; cursor:pointer; font-size:16px; }
+  .tabContent { display:none; }
+  .tabContent.active { display:block; }
+  table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+  th, td { border: 1px solid #ccc; padding: 8px; text-align:left; }
+  th { background:#eee; }
+  input, button { padding:8px; margin:5px 0; width: 100%; box-sizing: border-box; font-size:16px; }
+  button.deleteBtn { width: auto; background: #e74c3c; color: white; border:none; cursor:pointer; }
+  #message { margin: 10px 0; font-weight: bold; color: green; }
+</style>
+<script>
+function showTab(tabName) {
+  document.querySelectorAll('.tabContent').forEach(tab => tab.classList.remove('active'));
+  document.getElementById(tabName).classList.add('active');
+  document.getElementById('message').innerText = '';
+  if(tabName === 'registerTab') {
+    fetch('/getUID').then(res => res.text()).then(uid => {
+      document.getElementById('uidField').value = uid;
+      document.getElementById('uidText').innerText = uid;
+    });
+    loadUsers();
+  } else if(tabName === 'attendanceTab') {
+    loadAttendance();
+  }
+}
+
+function submitRegistration(e) {
+  e.preventDefault();
+  let form = e.target;
+  let params = new URLSearchParams(new FormData(form)).toString();
+  fetch('/enroll?' + params).then(res => res.text()).then(text => {
+    document.getElementById('message').innerText = text;
+    if(text.includes('successfully')) {
+      form.reset();
+      fetch('/getUID').then(res => res.text()).then(uid => {
+        document.getElementById('uidField').value = uid;
+        document.getElementById('uidText').innerText = uid;
+      });
+      loadUsers();
+    }
+  });
+}
+
+function loadUsers() {
+  fetch('/userlist').then(res => res.json()).then(data => {
+    let table = '<table><tr><th>UID</th><th>Name</th><th>Age</th><th>Residence</th><th>Action</th></tr>';
+    data.forEach(user => {
+      table += `<tr>
+        <td>${user.uid}</td>
+        <td>${user.name}</td>
+        <td>${user.age}</td>
+        <td>${user.residence}</td>
+        <td><button class="deleteBtn" onclick="deleteUser('${user.uid}')">Delete</button></td>
+      </tr>`;
+    });
+    table += '</table>';
+    document.getElementById('userList').innerHTML = table;
+  });
+}
+
+function deleteUser(uid) {
+  if(confirm('Delete user with UID ' + uid + '?')) {
+    fetch('/deleteUser?uid=' + encodeURIComponent(uid)).then(res => res.text()).then(text => {
+      document.getElementById('message').innerText = text;
+      loadUsers();
+    });
+  }
+}
+
+function loadAttendance() {
+  fetch('/attendanceList').then(res => res.json()).then(data => {
+    if(data.length === 0) {
+      document.getElementById('attendanceList').innerHTML = '<p>No attendance records yet.</p>';
+      return;
+    }
+    let list = '<ul>';
+    data.forEach(item => {
+      list += `<li>${item}</li>`;
+    });
+    list += '</ul>';
+    document.getElementById('attendanceList').innerHTML = list;
+  });
+}
+
+window.onload = function() {
+  showTab('attendanceTab'); // default tab
+};
+</script>
+</head><body>
+
+<h1>Smart Attendance System</h1>
+<div class="tabs">
+  <button onclick="showTab('attendanceTab')">Attendance List</button>
+  <button onclick="showTab('registerTab')">Register User</button>
+</div>
+
+<div id="attendanceTab" class="tabContent">
+  <h2>Attendance List</h2>
+  <button onclick="fetch('/scanAttendance').then(res => res.text()).then(text => { alert(text); loadAttendance(); })">Scan Card Now</button>
+  <div id="attendanceList"><p>Loading...</p></div>
+</div>
+
+<div id="registerTab" class="tabContent">
+  <h2>Register New User</h2>
+  <p>Detected UID: <b><span id="uidText"></span></b></p>
+  <form id="regForm" onsubmit="submitRegistration(event)">
+    <input type="hidden" name="uid" id="uidField" required>
+    <input type="text" name="name" placeholder="Full Name" required><br>
+    <input type="text" name="age" placeholder="Age" required><br>
+    <input type="text" name="residence" placeholder="Residence" required><br>
+    <button type="submit">Enroll Card</button>
+  </form>
+  <div id="message"></div>
+  <h3>Registered Users</h3>
+  <div id="userList">Loading...</div>
+</div>
+
+</body></html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", mainPage);
+  });
+
+  server.on("/getUID", HTTP_GET, []() {
+    String uid = waitForCard();
+    server.send(200, "text/plain", uid != "" ? uid : "No Card");
+  });
+
+  server.on("/enroll", HTTP_GET, []() {
+    if (userCount >= MAX_USERS) {
+      server.send(200, "text/plain", "❌ User limit reached");
+      return;
+    }
+    String uid = server.arg("uid");
+    String name = server.arg("name");
+    String age = server.arg("age");
+    String residence = server.arg("residence");
+
+    for (int i = 0; i < userCount; i++) {
+      if (users[i].uid == uid) {
+        server.send(200, "text/plain", "❌ UID already registered.");
+        return;
+      }
+    }
+
+    users[userCount] = {uid, name, age, residence, 0, 0};
+    userCount++;
+    server.send(200, "text/plain", "✅ User registered successfully.");
+  });
+
+  server.on("/scanAttendance", HTTP_GET, []() {
+    String uid = waitForCard();
+    if (uid == "") {
+      server.send(200, "text/plain", "❌ No card scanned.");
+      return;
+    }
+    for (int i = 0; i < userCount; i++) {
+      if (users[i].uid == uid) {
+        users[i].lastAttendance = millis();
+        users[i].attendanceCount++;
+        String entry = "✅ " + users[i].name + " (Age: " + users[i].age + ", From: " + users[i].residence + ") at " + timeNow();
+        if (logIndex < 50) {
+          attendanceLog[logIndex++] = entry;
+        }
+        server.send(200, "text/plain", entry);
+        return;
+      }
+    }
+    server.send(200, "text/plain", "❌ UID not registered! Please register first.");
+  });
+
+  server.on("/attendanceList", HTTP_GET, []() {
+    String json = "[";
+    for (int i = 0; i < logIndex; i++) {
+      json += "\"" + attendanceLog[i] + "\"";
+      if (i < logIndex - 1) json += ",";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/userlist", HTTP_GET, []() {
+    String json = "[";
+    for (int i = 0; i < userCount; i++) {
+      json += "{\"uid\":\"" + users[i].uid + "\",\"name\":\"" + users[i].name + "\",\"age\":\"" + users[i].age + "\",\"residence\":\"" + users[i].residence + "\"}";
+      if (i < userCount - 1) json += ",";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/deleteUser", HTTP_GET, []() {
+    String uidToDelete = server.arg("uid");
+    for (int i = 0; i < userCount; i++) {
+      if (users[i].uid == uidToDelete) {
+        for (int j = i; j < userCount - 1; j++) {
+          users[j] = users[j + 1];
+        }
+        userCount--;
+        server.send(200, "text/plain", "✅ User deleted successfully.");
+        return;
+      }
+    }
+    server.send(200, "text/plain", "❌ User not found.");
+  });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
+
+String waitForCard() {
+  Serial.println("Waiting for RFID card...");
+  for (int i = 0; i < 200; i++) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      String uid = "";
+      for (byte j = 0; j < mfrc522.uid.size; j++) {
+        uid += String(mfrc522.uid.uidByte[j] < 0x10 ? "0" : "");
+        uid += String(mfrc522.uid.uidByte[j], HEX);
+      }
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      uid.toUpperCase();
+      Serial.println("Card UID: " + uid);
+      return uid;
+    }
+    delay(100);
+  }
+  return "";
+}
+
+String timeNow() {
+  return String(millis() / 1000) + "s since boot";
+}
