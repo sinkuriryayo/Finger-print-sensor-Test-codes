@@ -1,0 +1,213 @@
+// === Smart Fingerprint Attendance System (Registration + Attendance UI) ===
+// Ali SINKURIRYAYO - ESP32 + AS608 Fingerprint Sensor
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
+
+// === Fingerprint Setup ===
+HardwareSerial mySerial(2);  // GPIO 16 = RX, 17 = TX
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+// === WiFi Setup ===
+const char* ssid = "FingerprintSystem";
+const char* password = "@12345678";
+WebServer server(80);
+
+// === User and Attendance Storage ===
+struct User {
+  int id;
+  String name;
+  String age;
+  String residence;
+};
+User users[100];
+int userCount = 0;
+
+struct AttendanceLog {
+  int id;
+  String name;
+  String timestamp;
+};
+AttendanceLog logs[100];
+int logCount = 0;
+
+// === State ===
+bool sensorReady = false;
+bool fingerStillOn = false;
+bool fingerCaptured = false;
+int enrollID = 1;
+String fingerStatus = "🔴 No finger on sensor.";
+
+// === Helper ===
+String getCurrentTime() {
+  unsigned long ms = millis();
+  int seconds = ms / 1000;
+  return "T+" + String(seconds) + "s";
+}
+
+String generateRegisteredTable() {
+  String table = "<h3>Registered Users</h3><table border='1'><tr><th>ID</th><th>Name</th><th>Age</th><th>Residence</th></tr>";
+  for (int i = 0; i < userCount; i++) {
+    table += "<tr><td>" + String(users[i].id) + "</td><td>" + users[i].name + "</td><td>" + users[i].age + "</td><td>" + users[i].residence + "</td></tr>";
+  }
+  table += "</table>";
+  return table;
+}
+
+String generateAttendanceTable() {
+  String table = "<h3>Attendance Log</h3><table border='1'><tr><th>ID</th><th>Name</th><th>Time</th></tr>";
+  for (int i = 0; i < logCount; i++) {
+    table += "<tr><td>" + String(logs[i].id) + "</td><td>" + logs[i].name + "</td><td>" + logs[i].timestamp + "</td></tr>";
+  }
+  table += "</table>";
+  return table;
+}
+
+// === Core Setup ===
+void setup() {
+  Serial.begin(115200);
+  mySerial.begin(57600, SERIAL_8N1, 16, 17);
+  finger.begin(57600);
+
+  if (finger.verifyPassword()) {
+    sensorReady = true;
+    Serial.println("✅ Fingerprint sensor ready.");
+  } else {
+    Serial.println("❌ Sensor not found.");
+  }
+
+  WiFi.softAP(ssid, password);
+  Serial.println("ESP32 IP: " + WiFi.softAPIP().toString());
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/submit", HTTP_POST, handleSubmit);
+  server.on("/logs", handleLogs);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  if (sensorReady) handleFingerprint();
+}
+
+// === Fingerprint Logic ===
+void handleFingerprint() {
+  int r = finger.getImage();
+
+  if (r == FINGERPRINT_OK && !fingerStillOn) {
+    fingerStillOn = true;
+    delay(300);
+
+    if (finger.image2Tz(1) != FINGERPRINT_OK) return;
+    delay(300);
+
+    if (finger.fingerSearch() == FINGERPRINT_OK) {
+      int id = finger.fingerID;
+      String name = getUserName(id);
+
+      if (name == "Unknown") {
+        fingerStatus = "❌ Not registered. Please register first.";
+        return;
+      }
+
+      if (!alreadyLogged(id)) {
+        logs[logCount++] = { id, name, getCurrentTime() };
+        fingerStatus = "✅ Welcome, " + name + "! Logged at " + getCurrentTime();
+      } else {
+        fingerStatus = "ℹ️ " + name + " already logged.";
+      }
+    } else {
+      fingerStatus = "❌ Finger not recognized.";
+    }
+  } else if (r == FINGERPRINT_NOFINGER && fingerStillOn) {
+    fingerStillOn = false;
+    fingerStatus = "🔴 No finger on sensor.";
+  }
+}
+
+// === Utilities ===
+String getUserName(int id) {
+  for (int i = 0; i < userCount; i++) {
+    if (users[i].id == id) return users[i].name;
+  }
+  return "Unknown";
+}
+
+bool alreadyLogged(int id) {
+  for (int i = 0; i < logCount; i++) {
+    if (logs[i].id == id) return true;
+  }
+  return false;
+}
+
+// === Web Routes ===
+void handleRoot() {
+  String html = R"rawliteral(
+  <html><head><style>
+    body { font-family: Arial; text-align: center; }
+    button { padding: 10px 20px; margin: 10px; font-size: 16px; }
+    .tab { display: none; padding: 20px; }
+    .active { display: block; }
+    input { margin: 5px; padding: 8px; width: 200px; }
+  </style>
+  <script>
+    function show(tab) {
+      document.getElementById("reg").classList.remove("active");
+      document.getElementById("att").classList.remove("active");
+      document.getElementById(tab).classList.add("active");
+    }
+    async function updateStatus() {
+      const res = await fetch('/status');
+      document.getElementById("status").innerText = await res.text();
+    }
+    setInterval(updateStatus, 1000);
+  </script></head><body>
+  <h2>Smart Fingerprint System</h2>
+  <button onclick="show('att')">📋 Attendance</button>
+  <button onclick="show('reg')">🧍 Register</button>
+
+  <div id="att" class="tab active">
+    <h3>Attendance Mode</h3>
+    <div id="status">Waiting...</div>
+    <br>
+    )rawliteral";
+  html += generateAttendanceTable();
+  html += R"rawliteral(
+  </div>
+
+  <div id="reg" class="tab">
+    <h3>Register New User</h3>
+    <form action="/submit" method="POST">
+      <input name="name" placeholder="Full Name" required><br>
+      <input name="age" placeholder="Age" required><br>
+      <input name="residence" placeholder="Residence" required><br>
+      <button type="submit">Save User</button>
+    </form>
+    <div id="registered">
+  )rawliteral";
+  html += generateRegisteredTable();
+  html += R"rawliteral(</div></div></body></html>)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  server.send(200, "text/plain", fingerStatus);
+}
+
+void handleSubmit() {
+  if (!fingerCaptured) {
+    users[userCount++] = {enrollID++, server.arg("name"), server.arg("age"), server.arg("residence")};
+    server.sendHeader("Location", "/");
+    server.send(303);
+    fingerCaptured = false;
+  } else {
+    server.send(200, "text/html", "<h3>⚠️ Please wait for finger capture. <a href='/'>Back</a></h3>");
+  }
+}
+
+void handleLogs() {
+  String html = "<html><body>" + generateAttendanceTable() + "</body></html>";
+  server.send(200, "text/html", html);
+}
